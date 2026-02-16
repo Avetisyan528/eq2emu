@@ -53,6 +53,7 @@
 #include "EQ2_Common_Structs.h"
 #include "Log.h"
 
+#definfe WRITE_PACKETS 1
 
 //#define DEBUG_EMBEDDED_PACKETS 1
 uint16 EQStream::MaxWindowSize=2048;
