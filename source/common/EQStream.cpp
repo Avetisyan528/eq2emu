@@ -21,6 +21,7 @@
 #include <WinSock2.h>
 	#include <windows.h>
 #endif
+#define WRITE_PACKETS
 #include "debug.h"
 #include <string>
 #include <iomanip>
@@ -53,7 +54,6 @@
 #include "EQ2_Common_Structs.h"
 #include "Log.h"
 
-#define WRITE_PACKETS
 
 //#define DEBUG_EMBEDDED_PACKETS 1
 uint16 EQStream::MaxWindowSize=2048;
@@ -311,13 +311,13 @@ bool EQStream::HandleEmbeddedPacket(EQProtocolPacket *p, int16 offset, int16 len
 	return false;
 }
 
-void EQStream::ProcessPacket(EQProtocolPacket *p, EQProtocolPacket* lastp)
+void EQStream::ProcessPacket(EQProtocolPacket* p, EQProtocolPacket* lastp)
 {
-	uint32 processed=0,subpacket_length=0;
+	uint32 processed = 0, subpacket_length = 0;
 
 	if (p) {
 
-		if (p->opcode!=OP_SessionRequest && p->opcode!=OP_SessionResponse && !Session) {
+		if (p->opcode != OP_SessionRequest && p->opcode != OP_SessionResponse && !Session) {
 #ifdef EQN_DEBUG
 			LogWrite(PACKET__ERROR, 0, "Packet", "*** Session not initialized, packet ignored ");
 			//p->DumpRaw();
@@ -325,496 +325,518 @@ void EQStream::ProcessPacket(EQProtocolPacket *p, EQProtocolPacket* lastp)
 			return;
 		}
 
- 		//cout << "Received " << (int)p->opcode << ":\n";
+		//cout << "Received " << (int)p->opcode << ":\n";
 		//DumpPacket(p->pBuffer, p->size);
 		switch (p->opcode) {
-			case OP_Combined: {
-				processed=0;
-				int8 offset = 0;
-				int count = 0;
+		case OP_Combined: {
+			processed = 0;
+			int8 offset = 0;
+			int count = 0;
 #ifdef LE_DEBUG
-				printf( "OP_Combined:\n");
-				DumpPacket(p);
+			printf("OP_Combined:\n");
+			DumpPacket(p);
 #endif
-				while(processed<p->size) {
-					if ((subpacket_length=(unsigned char)*(p->pBuffer+processed))==0xff) {
-						subpacket_length = ntohs(*(uint16*)(p->pBuffer + processed + 1));
-						//printf("OP_Combined subpacket_length %u\n",subpacket_length);
-						offset = 3;
-					}
-					else {
-						offset = 1;
-					}
-					
-					//printf("OP_Combined processed %u p->size %u subpacket length %u count %i\n",processed, p->size, subpacket_length, count);
-					count++;
+			while (processed < p->size) {
+				if ((subpacket_length = (unsigned char)*(p->pBuffer + processed)) == 0xff) {
+					subpacket_length = ntohs(*(uint16*)(p->pBuffer + processed + 1));
+					//printf("OP_Combined subpacket_length %u\n",subpacket_length);
+					offset = 3;
+				}
+				else {
+					offset = 1;
+				}
+
+				//printf("OP_Combined processed %u p->size %u subpacket length %u count %i\n",processed, p->size, subpacket_length, count);
+				count++;
 #ifdef LE_DEBUG
-					printf( "OP_Combined Packet %i (%u) (%u):\n", count, subpacket_length, processed);
+				printf("OP_Combined Packet %i (%u) (%u):\n", count, subpacket_length, processed);
 #endif
-					bool isSubPacket = EQProtocolPacket::IsProtocolPacket(p->pBuffer + processed + offset, subpacket_length, false);
-					if (isSubPacket) {
-						EQProtocolPacket* subp = new EQProtocolPacket(p->pBuffer + processed + offset, subpacket_length);
+				bool isSubPacket = EQProtocolPacket::IsProtocolPacket(p->pBuffer + processed + offset, subpacket_length, false);
+				if (isSubPacket) {
+					EQProtocolPacket* subp = new EQProtocolPacket(p->pBuffer + processed + offset, subpacket_length);
+					subp->copyInfo(p);
+#ifdef LE_DEBUG
+					printf("Opcode %i:\n", subp->opcode);
+					DumpPacket(subp);
+#endif
+					ProcessPacket(subp, p);
+#ifdef LE_DEBUG
+					DumpPacket(subp);
+#endif
+					delete subp;
+				}
+				else {
+					offset = 1; // 0xFF in this case means it is actually 255 bytes of encrypted data after a 00 09 packet
+					//Garbage packet?
+					if (ntohs(*reinterpret_cast<uint16_t*>(p->pBuffer + processed + offset)) <= 0x1e) {
+						subpacket_length = (unsigned char)*(p->pBuffer + processed);
+						LogWrite(PACKET__ERROR, 0, "Packet", "!!!!!!!!!Garbage Packet Unknown Process as OP_Packet!!!!!!!!!!!!!\n");
+						DumpPacket(p->pBuffer + processed + offset, subpacket_length);
+						uchar* newbuf = p->pBuffer;
+						newbuf += processed + offset;
+						EQProtocolPacket* subp = new EQProtocolPacket(newbuf, subpacket_length);
 						subp->copyInfo(p);
-#ifdef LE_DEBUG
-						printf( "Opcode %i:\n", subp->opcode);
-						DumpPacket(subp);
-#endif
 						ProcessPacket(subp, p);
-#ifdef LE_DEBUG
-						DumpPacket(subp);
-#endif
 						delete subp;
 					}
 					else {
-						offset = 1; // 0xFF in this case means it is actually 255 bytes of encrypted data after a 00 09 packet
-						//Garbage packet?
-						if(ntohs(*reinterpret_cast<uint16_t*>(p->pBuffer + processed + offset)) <= 0x1e) {
-							subpacket_length=(unsigned char)*(p->pBuffer+processed);
-							LogWrite(PACKET__ERROR, 0, "Packet", "!!!!!!!!!Garbage Packet Unknown Process as OP_Packet!!!!!!!!!!!!!\n");
-							DumpPacket(p->pBuffer + processed + offset, subpacket_length);
+						crypto->RC4Decrypt(p->pBuffer + processed + offset, subpacket_length);
+						LogWrite(PACKET__ERROR, 0, "Packet", "!!!!!!!!!Garbage Packet!!!!!!!!!!!!! processed: %u, offset: %u, count: %i, subpacket_length: %u, offset_pos_1: %u, oversized_buffer_present: %u, offset size: %u, offset length: %u\n",
+							processed, offset, count, subpacket_length, p->pBuffer[processed + offset], oversize_buffer ? 1 : 0, oversize_offset, oversize_length);
+						if (p->pBuffer[processed + offset] == 0xff)
+						{
 							uchar* newbuf = p->pBuffer;
-							newbuf += processed + offset;
-							EQProtocolPacket *subp=new EQProtocolPacket(newbuf,subpacket_length);
+							newbuf += processed + offset + 1;
+
+							DumpPacket(p->pBuffer + processed + offset, subpacket_length);
+							EQProtocolPacket* subp = new EQProtocolPacket(newbuf, subpacket_length, OP_Packet);
+							subp->copyInfo(p);
+							ProcessPacket(subp, p);
+							delete subp;
+						}
+						else
+							break; // bad packet
+					}
+				}
+				processed += subpacket_length + offset;
+			}
+			break;
+		}
+
+		case OP_AppCombined: {
+			processed = 0;
+			EQProtocolPacket* newpacket = 0;
+			int8 offset = 0;
+#ifdef DEBUG_EMBEDDED_PACKETS
+			printf("OP_AppCombined: \n");
+			DumpPacket(p);
+#endif
+			int count = 0;
+			while (processed < p->size) {
+				count++;
+				if ((subpacket_length = (unsigned char)*(p->pBuffer + processed)) == 0xff) {
+					subpacket_length = ntohs(*(uint16*)(p->pBuffer + processed + 1));
+					offset = 3;
+				}
+				else
+					offset = 1;
+
+				if (crypto->getRC4Key() == 0 && p && subpacket_length > 8 + offset) {
+#ifdef DEBUG_EMBEDDED_PACKETS
+					DumpPacket(p->pBuffer, p->size);
+#endif
+					p->pBuffer += offset;
+					processRSAKey(p, subpacket_length);
+					p->pBuffer -= offset;
+				}
+				else if (crypto->isEncrypted()) {
+#ifdef DEBUG_EMBEDDED_PACKETS
+					printf("OP_AppCombined Packet %i (%u) (%u): \n", count, subpacket_length, processed);
+					DumpPacket(p->pBuffer + processed + offset, subpacket_length);
+#endif
+					if (!HandleEmbeddedPacket(p, processed + offset, subpacket_length)) {
+						uchar* buffer = (p->pBuffer + processed + offset);
+						if (!ProcessEmbeddedPacket(buffer, subpacket_length, OP_AppCombined)) {
+							LogWrite(PACKET__ERROR, 0, "Packet", "*** This is bad, ProcessEmbeddedPacket failed, report to Image!");
+						}
+					}
+				}
+				processed += subpacket_length + offset;
+			}
+		}
+						   break;
+
+		case OP_Packet: {
+			if (!p->pBuffer || (p->Size() < 4))
+			{
+				break;
+			}
+
+			uint16 seq = ntohs(*(uint16*)(p->pBuffer));
+			sint8 check = CompareSequence(NextInSeq, seq);
+			if (check == SeqFuture) {
+#ifdef EQN_DEBUG
+				LogWrite(PACKET__DEBUG, 1, "Packet", "*** Future packet: Expecting Seq=%i, but got Seq=%i", NextInSeq, seq);
+				LogWrite(PACKET__DEBUG, 1, "Packet", "[Start]");
+				p->DumpRawHeader(seq);
+				LogWrite(PACKET__DEBUG, 1, "Packet", "[End]");
+#endif
+				OutOfOrderpackets[seq] = p->Copy();
+
+				// Image (2020): Removed as this is bad contributes to infinite loop
+				//SendOutOfOrderAck(seq);
+			}
+			else if (check == SeqPast) {
+#ifdef EQN_DEBUG
+				LogWrite(PACKET__DEBUG, 1, "Packet", "*** Duplicate packet: Expecting Seq=%i, but got Seq=%i", NextInSeq, seq);
+				LogWrite(PACKET__DEBUG, 1, "Packet", "[Start]");
+				p->DumpRawHeader(seq);
+				LogWrite(PACKET__DEBUG, 1, "Packet", "[End]");
+#endif
+				// Image (2020): Removed as this is bad contributes to infinite loop
+				//OutOfOrderpackets[seq] = p->Copy();
+				SendOutOfOrderAck(seq);
+			}
+			else {
+				EQProtocolPacket* qp = RemoveQueue(seq);
+				if (qp) {
+					LogWrite(PACKET__DEBUG, 1, "Packet", "OP_Fragment: Removing older queued packet with sequence %i", seq);
+					delete qp;
+				}
+
+				SetNextAckToSend(seq);
+				NextInSeq++;
+
+				if (HandleEmbeddedPacket(p))
+					break;
+
+				if (crypto->getRC4Key() == 0 && p && p->size >= 69) {
+#ifdef DEBUG_EMBEDDED_PACKETS
+					DumpPacket(p->pBuffer, p->size);
+#endif
+					processRSAKey(p);
+				}
+				else if (crypto->isEncrypted() && p) {
+					MCombineQueueLock.lock();
+					EQProtocolPacket* newpacket = ProcessEncryptedPacket(p);
+					MCombineQueueLock.unlock();
+					if (newpacket) {
+						EQApplicationPacket* ap = newpacket->MakeApplicationPacket(2);
+						if (ap) {
+							if (ap->version == 0)
+								ap->version = client_version;
+#ifdef WRITE_PACKETS
+							// Log decrypted bytes so opcode name matches content
+							WritePackets(ap->GetOpcodeName(), newpacket->pBuffer, newpacket->size, false);
+#endif
+							InboundQueuePush(ap);
+						}
+						else {
+							LogWrite(PACKET__ERROR, 0, "Packet", "MakeApplicationPacket returned NULL in OP_Packet");
+						}
+						safe_delete(newpacket);
+					}
+				}
+			}
+		}
+					  break;
+
+		case OP_Fragment: {
+			if (!p->pBuffer || (p->Size() < 4))
+			{
+				break;
+			}
+
+			uint16 seq = ntohs(*(uint16*)(p->pBuffer));
+			sint8 check = CompareSequence(NextInSeq, seq);
+			if (check == SeqFuture) {
+#ifdef EQN_DEBUG
+				LogWrite(PACKET__DEBUG, 1, "Packet", "*** Future packet2: Expecting Seq=%i, but got Seq=%i", NextInSeq, seq);
+				LogWrite(PACKET__DEBUG, 1, "Packet", "[Start]");
+				//p->DumpRawHeader(seq);
+				LogWrite(PACKET__DEBUG, 1, "Packet", "[End]");
+#endif
+				OutOfOrderpackets[seq] = p->Copy();
+				//SendOutOfOrderAck(seq);
+			}
+			else if (check == SeqPast) {
+#ifdef EQN_DEBUG
+				LogWrite(PACKET__DEBUG, 1, "Packet", "*** Duplicate packet2: Expecting Seq=%i, but got Seq=%i", NextInSeq, seq);
+				LogWrite(PACKET__DEBUG, 1, "Packet", "[Start]");
+				//p->DumpRawHeader(seq);
+				LogWrite(PACKET__DEBUG, 1, "Packet", "[End]");
+#endif
+				//OutOfOrderpackets[seq] = p->Copy();
+				SendOutOfOrderAck(seq);
+			}
+			else {
+				// In case we did queue one before as well.
+				EQProtocolPacket* qp = RemoveQueue(seq);
+				if (qp) {
+					LogWrite(PACKET__DEBUG, 1, "Packet", "OP_Fragment: Removing older queued packet with sequence %i", seq);
+					delete qp;
+				}
+
+				SetNextAckToSend(seq);
+				NextInSeq++;
+				if (oversize_buffer) {
+					memcpy(oversize_buffer + oversize_offset, p->pBuffer + 2, p->size - 2);
+					oversize_offset += p->size - 2;
+					//cout << "Oversized is " << oversize_offset << "/" << oversize_length << " (" << (p->size-2) << ") Seq=" << seq << endl;
+					if (oversize_offset == oversize_length) {
+						if (*(p->pBuffer + 2) == 0x00 && *(p->pBuffer + 3) == 0x19) {
+							EQProtocolPacket* subp = new EQProtocolPacket(oversize_buffer, oversize_offset);
 							subp->copyInfo(p);
 							ProcessPacket(subp, p);
 							delete subp;
 						}
 						else {
-							crypto->RC4Decrypt(p->pBuffer + processed + offset, subpacket_length);
-							LogWrite(PACKET__ERROR, 0, "Packet", "!!!!!!!!!Garbage Packet!!!!!!!!!!!!! processed: %u, offset: %u, count: %i, subpacket_length: %u, offset_pos_1: %u, oversized_buffer_present: %u, offset size: %u, offset length: %u\n", 
-							processed, offset, count, subpacket_length, p->pBuffer[processed + offset], oversize_buffer ? 1 : 0, oversize_offset, oversize_length);
-							if(p->pBuffer[processed + offset] == 0xff)
-							{
-								uchar* newbuf = p->pBuffer;
-								newbuf += processed + offset + 1;
 
-								DumpPacket(p->pBuffer + processed + offset, subpacket_length);
-								EQProtocolPacket *subp=new EQProtocolPacket(newbuf, subpacket_length, OP_Packet);
-								subp->copyInfo(p);
-								ProcessPacket(subp, p);
-								delete subp;
-							}
-							else
-								break; // bad packet
-						}
-					}
-					processed+=subpacket_length+offset;
-				}
-				break;
-			}
-			case OP_AppCombined: {
-				processed=0;
-				EQProtocolPacket* newpacket = 0;
-				int8 offset = 0;
-#ifdef DEBUG_EMBEDDED_PACKETS
-				printf( "OP_AppCombined: \n");
-				DumpPacket(p);
-#endif
-				int count = 0;
-				while(processed<p->size) {
-					count++;
-					if ((subpacket_length=(unsigned char)*(p->pBuffer+processed))==0xff) {
-						subpacket_length=ntohs(*(uint16 *)(p->pBuffer+processed+1));
-						offset = 3;
-					} else
-						offset = 1;
-					
-					if(crypto->getRC4Key()==0 && p && subpacket_length > 8+offset){
-					#ifdef DEBUG_EMBEDDED_PACKETS
-						DumpPacket(p->pBuffer, p->size);
-					#endif
-						p->pBuffer += offset;
-						processRSAKey(p, subpacket_length);
-						p->pBuffer -= offset;
-					}
-					else if(crypto->isEncrypted()){
-#ifdef DEBUG_EMBEDDED_PACKETS
-						printf( "OP_AppCombined Packet %i (%u) (%u): \n", count, subpacket_length, processed);
-						DumpPacket(p->pBuffer+processed+offset, subpacket_length);
-#endif
-						if(!HandleEmbeddedPacket(p, processed + offset, subpacket_length)){
-							uchar* buffer = (p->pBuffer + processed + offset);
-							if(!ProcessEmbeddedPacket(buffer, subpacket_length, OP_AppCombined)) {
-								LogWrite(PACKET__ERROR, 0, "Packet", "*** This is bad, ProcessEmbeddedPacket failed, report to Image!");
-							}
-						}
-					}
-					processed+=subpacket_length+offset;
-				}
-			}
-			break;
-			case OP_Packet: {
-				if (!p->pBuffer || (p->Size() < 4))
-				{
-					break;
-				}
+							if (crypto->isEncrypted() && p && p->size > 2) {
+								MCombineQueueLock.lock();
+								EQProtocolPacket* p2 = ProcessEncryptedData(oversize_buffer, oversize_offset, p->opcode);
+								MCombineQueueLock.unlock();
 
-				uint16 seq=ntohs(*(uint16 *)(p->pBuffer));
-				sint8 check=CompareSequence(NextInSeq,seq);
-				if (check == SeqFuture) {
-#ifdef EQN_DEBUG
-					LogWrite(PACKET__DEBUG, 1, "Packet", "*** Future packet: Expecting Seq=%i, but got Seq=%i", NextInSeq, seq);
-					LogWrite(PACKET__DEBUG, 1, "Packet", "[Start]");
-					p->DumpRawHeader(seq);
-					LogWrite(PACKET__DEBUG, 1, "Packet", "[End]");
-#endif				
-					OutOfOrderpackets[seq] = p->Copy();
-
-					// Image (2020): Removed as this is bad contributes to infinite loop
-					//SendOutOfOrderAck(seq);
-				} else if (check == SeqPast) {
-#ifdef EQN_DEBUG
-					LogWrite(PACKET__DEBUG, 1, "Packet", "*** Duplicate packet: Expecting Seq=%i, but got Seq=%i", NextInSeq, seq);
-					LogWrite(PACKET__DEBUG, 1, "Packet", "[Start]");
-					p->DumpRawHeader(seq);
-					LogWrite(PACKET__DEBUG, 1, "Packet", "[End]");
-#endif
-					// Image (2020): Removed as this is bad contributes to infinite loop
-					//OutOfOrderpackets[seq] = p->Copy();
-					SendOutOfOrderAck(seq);
-				} else {
-					EQProtocolPacket* qp = RemoveQueue(seq);
-					if (qp) {
-						LogWrite(PACKET__DEBUG, 1, "Packet", "OP_Fragment: Removing older queued packet with sequence %i", seq);
-						delete qp;
-					}
-					
-					SetNextAckToSend(seq);
-					NextInSeq++;
-					
-					if(HandleEmbeddedPacket(p))
-						break;
-					if(crypto->getRC4Key()==0 && p && p->size >= 69){
-					#ifdef DEBUG_EMBEDDED_PACKETS
-						DumpPacket(p->pBuffer, p->size);
-					#endif
-						processRSAKey(p);
-					}
-					else if(crypto->isEncrypted() && p){
-						MCombineQueueLock.lock();
-						EQProtocolPacket* newpacket = ProcessEncryptedPacket(p);
-						MCombineQueueLock.unlock();
-						if(newpacket){
-							EQApplicationPacket* ap = newpacket->MakeApplicationPacket(2);
-							if (ap->version == 0)
-								ap->version = client_version;
-#ifdef WRITE_PACKETS
-							WritePackets(ap->GetOpcodeName(), p->pBuffer, p->size, false);
-#endif
-							InboundQueuePush(ap);
-							safe_delete(newpacket);
-						}
-					}
-				}
-			}
-			break;
-			case OP_Fragment: {
-				if (!p->pBuffer || (p->Size() < 4))
-				{
-					break;
-				}
-
-				uint16 seq=ntohs(*(uint16 *)(p->pBuffer));
-				sint8 check=CompareSequence(NextInSeq,seq);
-				if (check == SeqFuture) {
-#ifdef EQN_DEBUG
-					LogWrite(PACKET__DEBUG, 1, "Packet", "*** Future packet2: Expecting Seq=%i, but got Seq=%i", NextInSeq, seq);
-					LogWrite(PACKET__DEBUG, 1, "Packet", "[Start]");
-					//p->DumpRawHeader(seq);
-					LogWrite(PACKET__DEBUG, 1, "Packet", "[End]");
-#endif
-					OutOfOrderpackets[seq] = p->Copy();
-					//SendOutOfOrderAck(seq);
-				} else if (check == SeqPast) {
-#ifdef EQN_DEBUG
-					LogWrite(PACKET__DEBUG, 1, "Packet", "*** Duplicate packet2: Expecting Seq=%i, but got Seq=%i", NextInSeq, seq);
-					LogWrite(PACKET__DEBUG, 1, "Packet", "[Start]");
-					//p->DumpRawHeader(seq);
-					LogWrite(PACKET__DEBUG, 1, "Packet", "[End]");
-#endif
-					//OutOfOrderpackets[seq] = p->Copy();
-					SendOutOfOrderAck(seq);
-				} else {
-					// In case we did queue one before as well.
-					EQProtocolPacket* qp = RemoveQueue(seq);
-					if (qp) {
-						LogWrite(PACKET__DEBUG, 1, "Packet", "OP_Fragment: Removing older queued packet with sequence %i", seq);
-						delete qp;
-					}
-
-					SetNextAckToSend(seq);
-					NextInSeq++;
-					if (oversize_buffer) {
-						memcpy(oversize_buffer+oversize_offset,p->pBuffer+2,p->size-2);
-						oversize_offset+=p->size-2;
-						//cout << "Oversized is " << oversize_offset << "/" << oversize_length << " (" << (p->size-2) << ") Seq=" << seq << endl;
-						if (oversize_offset==oversize_length) {
-							if (*(p->pBuffer+2)==0x00 && *(p->pBuffer+3)==0x19) {
-								EQProtocolPacket *subp=new EQProtocolPacket(oversize_buffer,oversize_offset);
-								subp->copyInfo(p);
-								ProcessPacket(subp, p);
-								delete subp;
-							} else {
-								
-								if(crypto->isEncrypted() && p && p->size > 2){
-									MCombineQueueLock.lock();
-									EQProtocolPacket* p2 = ProcessEncryptedData(oversize_buffer, oversize_offset, p->opcode);
-									MCombineQueueLock.unlock();
+								if (p2) {
 									EQApplicationPacket* ap = p2->MakeApplicationPacket(2);
-									ap->copyInfo(p);
-									if (ap->version == 0)
-										ap->version = client_version;
+									if (ap) {
+										ap->copyInfo(p);
+										if (ap->version == 0)
+											ap->version = client_version;
 #ifdef WRITE_PACKETS
-									WritePackets(ap->GetOpcodeName(), oversize_buffer, oversize_offset, false);
+										// Log decrypted bytes so opcode name matches content
+										WritePackets(ap->GetOpcodeName(), p2->pBuffer, p2->size, false);
 #endif
-									ap->copyInfo(p);
-									InboundQueuePush(ap);
+										ap->copyInfo(p);
+										InboundQueuePush(ap);
+									}
+									else {
+										LogWrite(PACKET__ERROR, 0, "Packet", "MakeApplicationPacket returned NULL in OP_Fragment oversize decrypt");
+									}
 									safe_delete(p2);
 								}
+								else {
+									LogWrite(PACKET__ERROR, 0, "Packet", "ProcessEncryptedData returned NULL in OP_Fragment oversize decrypt");
+								}
 							}
-							delete[] oversize_buffer;
-							oversize_buffer=NULL;
-							oversize_offset=0;
 						}
-					} else if (!oversize_buffer) {
-						oversize_length=ntohl(*(uint32 *)(p->pBuffer+2));
-						oversize_buffer=new unsigned char[oversize_length];
-						memcpy(oversize_buffer,p->pBuffer+6,p->size-6);
-						oversize_offset=p->size-6;
-						//cout << "Oversized is " << oversize_offset << "/" << oversize_length << " (" << (p->size-6) << ") Seq=" << seq << endl;
+						delete[] oversize_buffer;
+						oversize_buffer = NULL;
+						oversize_offset = 0;
 					}
 				}
-			}
-			break;
-			case OP_KeepAlive: {
-#ifndef COLLECTOR
-				NonSequencedPush(new EQProtocolPacket(p->opcode,p->pBuffer,p->size));
-#endif
-			}
-			break;
-			case OP_Ack: {
-				if (!p->pBuffer || (p->Size() < 4))
-				{
-					LogWrite(PACKET__DEBUG, 9, "Packet", "Received OP_Ack that was of malformed size");
-					break;
+				else if (!oversize_buffer) {
+					oversize_length = ntohl(*(uint32*)(p->pBuffer + 2));
+					oversize_buffer = new unsigned char[oversize_length];
+					memcpy(oversize_buffer, p->pBuffer + 6, p->size - 6);
+					oversize_offset = p->size - 6;
+					//cout << "Oversized is " << oversize_offset << "/" << oversize_length << " (" << (p->size-6) << ") Seq=" << seq << endl;
 				}
-				uint16 seq = ntohs(*(uint16*)(p->pBuffer));
-				AckPackets(seq);
-				retransmittimer = Timer::GetCurrentTime2();
 			}
-			break;
-			case OP_SessionRequest: {
-				if (p->Size() < sizeof(SessionRequest))
-				{
-					break;
-				}
-
-				if (GetState() == ESTABLISHED) {
-					//_log(NET__ERROR, _L "Received OP_SessionRequest in ESTABLISHED state (%d) streamactive (%i) attempt (%i)" __L, GetState(), streamactive, sessionAttempts);
-
-					// client seems to try a max of 4 times (initial +3 retries) then gives up, giving it a few more attempts just in case
-					// streamactive means we identified the opcode, we cannot re-establish this connection
-					if (streamactive || (sessionAttempts > 30))
-					{
-						SendDisconnect(false);
-						SetState(CLOSED);
+		}
 						break;
-					}
-				}
 
-				sessionAttempts++;
-				if(GetState() == WAIT_CLOSE) {
-					printf("WAIT_CLOSE Reconnect with streamactive %u, sessionAttempts %u\n", streamactive, sessionAttempts);
-					reconnectAttempt++;
-				}
-				init(GetState() != ESTABLISHED);
-				OutboundQueueClear();
-				SessionRequest *Request=(SessionRequest *)p->pBuffer;
-				Session=ntohl(Request->Session);
-				SetMaxLen(ntohl(Request->MaxLength));
+		case OP_KeepAlive: {
 #ifndef COLLECTOR
-				NextInSeq=0;
-				Key=0x33624702;
-				SendSessionResponse();
+			NonSequencedPush(new EQProtocolPacket(p->opcode, p->pBuffer, p->size));
 #endif
-				SetState(ESTABLISHED);
+		}
+						 break;
+
+		case OP_Ack: {
+			if (!p->pBuffer || (p->Size() < 4))
+			{
+				LogWrite(PACKET__DEBUG, 9, "Packet", "Received OP_Ack that was of malformed size");
+				break;
 			}
-			break;
-			case OP_SessionResponse: {
-				if (p->Size() < sizeof(SessionResponse))
+			uint16 seq = ntohs(*(uint16*)(p->pBuffer));
+			AckPackets(seq);
+			retransmittimer = Timer::GetCurrentTime2();
+		}
+				   break;
+
+		case OP_SessionRequest: {
+			if (p->Size() < sizeof(SessionRequest))
+			{
+				break;
+			}
+
+			if (GetState() == ESTABLISHED) {
+				//_log(NET__ERROR, _L "Received OP_SessionRequest in ESTABLISHED state (%d) streamactive (%i) attempt (%i)" __L, GetState(), streamactive, sessionAttempts);
+
+				// client seems to try a max of 4 times (initial +3 retries) then gives up, giving it a few more attempts just in case
+				// streamactive means we identified the opcode, we cannot re-establish this connection
+				if (streamactive || (sessionAttempts > 30))
 				{
+					SendDisconnect(false);
+					SetState(CLOSED);
 					break;
 				}
-				init();
-				OutboundQueueClear();
-				SetActive(true);
-				SessionResponse *Response=(SessionResponse *)p->pBuffer;
-				SetMaxLen(ntohl(Response->MaxLength));
-				Key=ntohl(Response->Key);
-				NextInSeq=0;
-				SetState(ESTABLISHED);
-				if (!Session)
-					Session=ntohl(Response->Session);
-				compressed=(Response->Format&FLAG_COMPRESSED);
-				encoded=(Response->Format&FLAG_ENCODED);
+			}
 
-				// Kinda kludgy, but trie for now
-				if (compressed) {
-					if (remote_port==9000 || (remote_port==0 && p->src_port==9000))
-						SetStreamType(WorldStream);
-					else
-						SetStreamType(ZoneStream);
-				} else if (encoded)
-					SetStreamType(ChatOrMailStream);
+			sessionAttempts++;
+			if (GetState() == WAIT_CLOSE) {
+				printf("WAIT_CLOSE Reconnect with streamactive %u, sessionAttempts %u\n", streamactive, sessionAttempts);
+				reconnectAttempt++;
+			}
+			init(GetState() != ESTABLISHED);
+			OutboundQueueClear();
+			SessionRequest* Request = (SessionRequest*)p->pBuffer;
+			Session = ntohl(Request->Session);
+			SetMaxLen(ntohl(Request->MaxLength));
+#ifndef COLLECTOR
+			NextInSeq = 0;
+			Key = 0x33624702;
+			SendSessionResponse();
+#endif
+			SetState(ESTABLISHED);
+		}
+							  break;
+
+		case OP_SessionResponse: {
+			if (p->Size() < sizeof(SessionResponse))
+			{
+				break;
+			}
+			init();
+			OutboundQueueClear();
+			SetActive(true);
+			SessionResponse* Response = (SessionResponse*)p->pBuffer;
+			SetMaxLen(ntohl(Response->MaxLength));
+			Key = ntohl(Response->Key);
+			NextInSeq = 0;
+			SetState(ESTABLISHED);
+			if (!Session)
+				Session = ntohl(Response->Session);
+			compressed = (Response->Format & FLAG_COMPRESSED);
+			encoded = (Response->Format & FLAG_ENCODED);
+
+			// Kinda kludgy, but trie for now
+			if (compressed) {
+				if (remote_port == 9000 || (remote_port == 0 && p->src_port == 9000))
+					SetStreamType(WorldStream);
 				else
-					SetStreamType(LoginStream);
+					SetStreamType(ZoneStream);
 			}
-			break;
-			case OP_SessionDisconnect: {
-				//NextInSeq=0;
-				SendDisconnect();
-				//SetState(CLOSED);
+			else if (encoded)
+				SetStreamType(ChatOrMailStream);
+			else
+				SetStreamType(LoginStream);
+		}
+							   break;
+
+		case OP_SessionDisconnect: {
+			//NextInSeq=0;
+			SendDisconnect();
+			//SetState(CLOSED);
+		}
+								 break;
+
+		case OP_OutOfOrderAck: {
+			if (!p->pBuffer || (p->Size() < 4))
+			{
+				LogWrite(PACKET__DEBUG, 9, "Packet", "Received OP_OutOfOrderAck that was of malformed size");
+				break;
 			}
-			break;
-			case OP_OutOfOrderAck: {
-				if (!p->pBuffer || (p->Size() < 4))
-				{
-					LogWrite(PACKET__DEBUG, 9, "Packet",  "Received OP_OutOfOrderAck that was of malformed size");
-					break;
-				}
-				uint16 seq = ntohs(*(uint16*)(p->pBuffer));
-				MOutboundQueue.lock();
+			uint16 seq = ntohs(*(uint16*)(p->pBuffer));
+			MOutboundQueue.lock();
 
-				if (uint16(SequencedBase + SequencedQueue.size()) != NextOutSeq) {
-					LogWrite(PACKET__DEBUG, 9, "Packet",  "Pre-OOA Invalid Sequenced queue: BS %u + SQ %u != NOS %u", SequencedBase, SequencedQueue.size(), NextOutSeq);
-				}
+			if (uint16(SequencedBase + SequencedQueue.size()) != NextOutSeq) {
+				LogWrite(PACKET__DEBUG, 9, "Packet", "Pre-OOA Invalid Sequenced queue: BS %u + SQ %u != NOS %u", SequencedBase, SequencedQueue.size(), NextOutSeq);
+			}
 
-				//if the packet they got out of order is between our last acked packet and the last sent packet, then its valid.
-				if (CompareSequence(SequencedBase, seq) != SeqPast && CompareSequence(NextOutSeq, seq) == SeqPast) {
-					uint16 sqsize = SequencedQueue.size();
-					uint16 index = seq - SequencedBase;
-					LogWrite(PACKET__DEBUG, 9, "Packet",  "OP_OutOfOrderAck marking packet acked in queue (queue index = %u, queue size = %u)", index, sqsize);
-					if (index < sqsize) {
-						SequencedQueue[index]->acked = true;
-						// flag packets for a resend
-						uint16 count = 0;
-						uint32 timeout = AverageDelta * 2 + 100;
-						for (auto sitr = SequencedQueue.begin(); sitr != SequencedQueue.end() && count < index; ++sitr, ++count) {
-							if (!(*sitr)->acked && (*sitr)->sent_time > 0 && (((*sitr)->sent_time + timeout) < Timer::GetCurrentTime2())) {
-								(*sitr)->sent_time = 0;
-								LogWrite(PACKET__DEBUG, 9, "Packet",  "OP_OutOfOrderAck Flagging packet %u for retransmission", SequencedBase + count);
-							}
+			//if the packet they got out of order is between our last acked packet and the last sent packet, then its valid.
+			if (CompareSequence(SequencedBase, seq) != SeqPast && CompareSequence(NextOutSeq, seq) == SeqPast) {
+				uint16 sqsize = SequencedQueue.size();
+				uint16 index = seq - SequencedBase;
+				LogWrite(PACKET__DEBUG, 9, "Packet", "OP_OutOfOrderAck marking packet acked in queue (queue index = %u, queue size = %u)", index, sqsize);
+				if (index < sqsize) {
+					SequencedQueue[index]->acked = true;
+					// flag packets for a resend
+					uint16 count = 0;
+					uint32 timeout = AverageDelta * 2 + 100;
+					for (auto sitr = SequencedQueue.begin(); sitr != SequencedQueue.end() && count < index; ++sitr, ++count) {
+						if (!(*sitr)->acked && (*sitr)->sent_time > 0 && (((*sitr)->sent_time + timeout) < Timer::GetCurrentTime2())) {
+							(*sitr)->sent_time = 0;
+							LogWrite(PACKET__DEBUG, 9, "Packet", "OP_OutOfOrderAck Flagging packet %u for retransmission", SequencedBase + count);
 						}
 					}
-
-					if (RETRANSMIT_TIMEOUT_MULT) {
-						retransmittimer = Timer::GetCurrentTime2();
-					}
-				}
-				else {
-					LogWrite(PACKET__DEBUG, 9, "Packet",  "Received OP_OutOfOrderAck for out-of-window %u. Window (%u->%u)", seq, SequencedBase, NextOutSeq);
 				}
 
-				if (uint16(SequencedBase + SequencedQueue.size()) != NextOutSeq) {
-					LogWrite(PACKET__DEBUG, 9, "Packet",  "Post-OOA Invalid Sequenced queue: BS %u + SQ %u != NOS %u", SequencedBase, SequencedQueue.size(), NextOutSeq);
+				if (RETRANSMIT_TIMEOUT_MULT) {
+					retransmittimer = Timer::GetCurrentTime2();
 				}
+			}
+			else {
+				LogWrite(PACKET__DEBUG, 9, "Packet", "Received OP_OutOfOrderAck for out-of-window %u. Window (%u->%u)", seq, SequencedBase, NextOutSeq);
+			}
 
-				MOutboundQueue.unlock();
+			if (uint16(SequencedBase + SequencedQueue.size()) != NextOutSeq) {
+				LogWrite(PACKET__DEBUG, 9, "Packet", "Post-OOA Invalid Sequenced queue: BS %u + SQ %u != NOS %u", SequencedBase, SequencedQueue.size(), NextOutSeq);
 			}
-			break;
-			case OP_ServerKeyRequest:{
-				if (p->Size() < sizeof(ClientSessionStats))
-				{
-					//_log(NET__ERROR, _L "Received OP_SessionStatRequest that was of malformed size" __L);
-					break;
-				}
-				
-				ClientSessionStats* Stats = (ClientSessionStats*)p->pBuffer;
-				int16 request_id = Stats->RequestID;
-				AdjustRates(ntohl(Stats->average_delta));
-				ServerSessionStats* stats=(ServerSessionStats*)p->pBuffer;
-                memset(stats, 0, sizeof(ServerSessionStats));
-				stats->RequestID = request_id;
-				stats->current_time = ntohl(Timer::GetCurrentTime2());
-				stats->sent_packets = ntohl(sent_packets);
-				stats->sent_packets2 = ntohl(sent_packets);
-				stats->received_packets = ntohl(received_packets);
-				stats->received_packets2 = ntohl(received_packets);
-				NonSequencedPush(new EQProtocolPacket(OP_SessionStatResponse,p->pBuffer,p->size));
-				if(!crypto->isEncrypted())
-					SendKeyRequest();
-				else
-					SendSessionResponse();
-			}
-			break;
-			case OP_SessionStatResponse: {
-				LogWrite(PACKET__INFO, 0, "Packet", "OP_SessionStatResponse");
-			}
-			break;
-			case OP_OutOfSession: {
-				LogWrite(PACKET__INFO, 0, "Packet", "OP_OutOfSession");
-				SendDisconnect();
-				SetState(CLOSED);
-			}
-			break;
-			default:
-				//EQApplicationPacket *ap = p->MakeApplicationPacket(app_opcode_size);
-				//InboundQueuePush(ap);
 
-				cout << "Orig Packet: " << p->opcode << endl;
-				DumpPacket(p->pBuffer, p->size);
-				if(p && p->size >= 69){
-					processRSAKey(p);
-				}
-				MCombineQueueLock.lock();
-				EQProtocolPacket* p2 = ProcessEncryptedData(p->pBuffer, p->size, OP_Packet);
-				MCombineQueueLock.unlock();
+			MOutboundQueue.unlock();
+		}
+							 break;
+
+		case OP_ServerKeyRequest: {
+			if (p->Size() < sizeof(ClientSessionStats))
+			{
+				//_log(NET__ERROR, _L "Received OP_SessionStatRequest that was of malformed size" __L);
+				break;
+			}
+
+			ClientSessionStats* Stats = (ClientSessionStats*)p->pBuffer;
+			int16 request_id = Stats->RequestID;
+			AdjustRates(ntohl(Stats->average_delta));
+			ServerSessionStats* stats = (ServerSessionStats*)p->pBuffer;
+			memset(stats, 0, sizeof(ServerSessionStats));
+			stats->RequestID = request_id;
+			stats->current_time = ntohl(Timer::GetCurrentTime2());
+			stats->sent_packets = ntohl(sent_packets);
+			stats->sent_packets2 = ntohl(sent_packets);
+			stats->received_packets = ntohl(received_packets);
+			stats->received_packets2 = ntohl(received_packets);
+			NonSequencedPush(new EQProtocolPacket(OP_SessionStatResponse, p->pBuffer, p->size));
+			if (!crypto->isEncrypted())
+				SendKeyRequest();
+			else
+				SendSessionResponse();
+		}
+								break;
+
+		case OP_SessionStatResponse: {
+			LogWrite(PACKET__INFO, 0, "Packet", "OP_SessionStatResponse");
+		}
+								   break;
+
+		case OP_OutOfSession: {
+			LogWrite(PACKET__INFO, 0, "Packet", "OP_OutOfSession");
+			SendDisconnect();
+			SetState(CLOSED);
+		}
+							break;
+
+		default:
+		{
+			cout << "Orig Packet: " << p->opcode << endl;
+			DumpPacket(p->pBuffer, p->size);
+
+			if (p && p->size >= 69) {
+				processRSAKey(p);
+			}
+
+			MCombineQueueLock.lock();
+			EQProtocolPacket* p2 = ProcessEncryptedData(p->pBuffer, p->size, OP_Packet);
+			MCombineQueueLock.unlock();
+
+			if (p2) {
 				cout << "Decrypted Packet: " << p2->opcode << endl;
 				DumpPacket(p2->pBuffer, p2->size);
-				
-				safe_delete(p2);
-			/*	if(p2)
-				{
-					EQApplicationPacket* ap = p2->MakeApplicationPacket(2);
+
+#ifdef WRITE_PACKETS
+				// Build an application packet only to obtain the opcode name for logging.
+				EQApplicationPacket* ap = p2->MakeApplicationPacket(app_opcode_size);
+				if (ap) {
 					if (ap->version == 0)
 						ap->version = client_version;
-					InboundQueuePush(ap);
-					safe_delete(p2);
-				}*/
-				
-				//EQProtocolPacket* puse = p2;
-			/*	if (!rogue_buffer) {
-						roguebuf_size=puse->size;
-						rogue_buffer=new unsigned char[roguebuf_size];
-						memcpy(rogue_buffer,puse->pBuffer,puse->size);
-						roguebuf_offset=puse->size;
-						cout << "RogueBuf is " << roguebuf_offset << "/" << roguebuf_size << " (" << (p->size-6) << ") NextInSeq=" << NextInSeq << endl;
-					}
-					else {
-						int32 new_size = roguebuf_size + puse->size;
-						uchar* tmp_buffer = new unsigned char[new_size];
-						uchar* ptr = tmp_buffer;
-						
-						memcpy(ptr,rogue_buffer,roguebuf_size);
-						ptr += roguebuf_size;
-						memcpy(ptr,puse->pBuffer,puse->size);
-						roguebuf_offset=puse->size;
 
-						safe_delete_array(rogue_buffer);
-
-						rogue_buffer = tmp_buffer;
-						roguebuf_size = new_size;
-						roguebuf_offset = new_size;
-						cout << "RogueBuf is " << roguebuf_offset << "/" << roguebuf_size << " (" << (p->size-6) << ") NextInSeq=" << NextInSeq << endl;
-				}*/
-#ifdef WRITE_PACKETS
-				WritePackets(ap->GetOpcodeName(), p->pBuffer, p->size, false);
+					WritePackets(ap->GetOpcodeName(), p2->pBuffer, p2->size, false);
+					safe_delete(ap);
+				}
+				else {
+					WritePackets("APP_DECODE_FAILED", p2->pBuffer, p2->size, false);
+				}
 #endif
-				//InboundQueuePush(ap);
-				LogWrite(PACKET__INFO, 0, "Packet", "Received unknown packet type, not adding to inbound queue");
-				//safe_delete(p2);
-				//SendDisconnect();
-				break;
+				safe_delete(p2);
+			}
+			else {
+				LogWrite(PACKET__ERROR, 0, "Packet", "ProcessEncryptedData returned NULL in default/unknown opcode handling");
+			}
+
+			LogWrite(PACKET__INFO, 0, "Packet", "Received unknown packet type, not adding to inbound queue");
+			break;
+		}
 		}
 	}
 }
